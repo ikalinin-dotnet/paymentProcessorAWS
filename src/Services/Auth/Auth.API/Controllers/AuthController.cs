@@ -1,4 +1,3 @@
-// src/Services/Auth/Auth.API/Controllers/AuthController.cs
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
