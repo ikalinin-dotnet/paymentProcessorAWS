@@ -1,0 +1,727 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Payment Processor Microservices Infrastructure'
+
+Parameters:
+  Environment:
+    Description: Environment (dev, test, prod)
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+  
+  VpcId:
+    Description: ID of the VPC to deploy into
+    Type: AWS::EC2::VPC::Id
+  
+  PublicSubnet1:
+    Description: First public subnet ID
+    Type: AWS::EC2::Subnet::Id
+  
+  PublicSubnet2:
+    Description: Second public subnet ID
+    Type: AWS::EC2::Subnet::Id
+  
+  PrivateSubnet1:
+    Description: First private subnet ID
+    Type: AWS::EC2::Subnet::Id
+  
+  PrivateSubnet2:
+    Description: Second private subnet ID
+    Type: AWS::EC2::Subnet::Id
+  
+  ECRRepositoryPrefix:
+    Description: ECR repo prefix for container images
+    Type: String
+    Default: 'payment-processor'
+  
+  ImageTag:
+    Description: Tag for container images
+    Type: String
+    Default: 'latest'
+
+  DBUsername:
+    Description: Master username for RDS
+    Type: String
+    NoEcho: true
+    Default: admin
+  
+  DBPassword:
+    Description: Master password for RDS
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Resources:
+  # Network Resources
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS services
+      VpcId: 
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS instance
+      VpcId: 
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: 
+            Ref: ECSSecurityGroup
+  
+  KafkaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MSK Kafka cluster
+      VpcId: 
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9092
+          ToPort: 9092
+          SourceSecurityGroupId: 
+            Ref: ECSSecurityGroup
+  
+  # Database Resources
+  RDSDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS
+      SubnetIds:
+        - Ref: PrivateSubnet1
+        - Ref: PrivateSubnet2
+  
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: sqlserver-se
+      EngineVersion: 15.00.4312.2.v1
+      DBInstanceClass: db.t3.small
+      AllocatedStorage: 20
+      StorageType: gp2
+      MasterUsername: 
+        Ref: DBUsername
+      MasterUserPassword: 
+        Ref: DBPassword
+      DBSubnetGroupName: 
+        Ref: RDSDBSubnetGroup
+      VPCSecurityGroups:
+        - Ref: DBSecurityGroup
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      DBInstanceIdentifier: 
+        Fn::Sub: payment-processor-${Environment}
+    DeletionPolicy: Snapshot
+  
+  # DynamoDB Tables
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 
+        Fn::Sub: Transactions-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: S
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: Status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIdIndex
+          KeySchema:
+            - AttributeName: UserId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: Status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+  
+  PaymentMethodsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 
+        Fn::Sub: PaymentMethods-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: S
+        - AttributeName: UserId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIdIndex
+          KeySchema:
+            - AttributeName: UserId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+  
+  # S3 Buckets
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 
+        Fn::Sub: payment-processor-logs-${Environment}-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: LogRetention
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  
+  # SQS Queues
+  PaymentNotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: 
+        Fn::Sub: payment-notifications-${Environment}
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600  # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt: PaymentNotificationDeadLetterQueue.Arn
+        maxReceiveCount: 5
+  
+  PaymentNotificationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: 
+        Fn::Sub: payment-notifications-dlq-${Environment}
+      MessageRetentionPeriod: 1209600  # 14 days
+  
+  # SNS Topics
+  PaymentNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: 
+        Fn::Sub: payment-notifications-${Environment}
+      DisplayName: Payment Notifications
+  
+  PaymentNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - Ref: PaymentNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: 
+              Ref: PaymentNotificationTopic
+  
+  PaymentNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: 
+        Ref: PaymentNotificationTopic
+      Protocol: sqs
+      Endpoint: 
+        Fn::GetAtt: PaymentNotificationQueue.Arn
+      RawMessageDelivery: true
+  
+  # SQS Queue Policy
+  PaymentNotificationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: PaymentNotificationQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: 
+              Fn::GetAtt: PaymentNotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: 
+                  Ref: PaymentNotificationTopic
+  
+  # MSK (Kafka) Cluster
+  MSKCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: 
+        Fn::Sub: payment-processor-kafka-${Environment}
+      KafkaVersion: 2.8.1
+      NumberOfBrokerNodes: 2
+      BrokerNodeGroupInfo:
+        InstanceType: kafka.t3.small
+        ClientSubnets:
+          - Ref: PrivateSubnet1
+          - Ref: PrivateSubnet2
+        SecurityGroups:
+          - Ref: KafkaSecurityGroup
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: 20
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS_PLAINTEXT
+          InCluster: true
+  
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: 
+        Fn::Sub: payment-processor-cluster-${Environment}
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+  
+  # IAM Roles
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Path: /
+  
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+  
+  ECSTaskRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: 
+        Fn::Sub: payment-processor-task-policy-${Environment}
+      Roles:
+        - Ref: ECSTaskRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource:
+              - Fn::GetAtt: TransactionsTable.Arn
+              - Fn::GetAtt: PaymentMethodsTable.Arn
+              - Fn::Sub: ${TransactionsTable.Arn}/index/*
+              - Fn::Sub: ${PaymentMethodsTable.Arn}/index/*
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: 
+              Fn::GetAtt: PaymentNotificationQueue.Arn
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: 
+              Ref: PaymentNotificationTopic
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: "*"
+  
+  # Load Balancer
+  ApiGatewayLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: 
+        Fn::Sub: payment-processor-alb-${Environment}
+      Subnets:
+        - Ref: PublicSubnet1
+        - Ref: PublicSubnet2
+      SecurityGroups:
+        - Ref: ECSSecurityGroup
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+  
+  ApiGatewayHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: 
+        Ref: ApiGatewayLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: 
+            Ref: ApiGatewayTargetGroup
+  
+  ApiGatewayTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: 
+        Fn::Sub: api-gateway-tg-${Environment}
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      VpcId: 
+        Ref: VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+  
+  # ECR Repositories
+  ApiGatewayRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: 
+        Fn::Sub: ${ECRRepositoryPrefix}/api-gateway-${Environment}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+  
+  PaymentServiceRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: 
+        Fn::Sub: ${ECRRepositoryPrefix}/payment-service-${Environment}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+  
+  NotificationServiceRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: 
+        Fn::Sub: ${ECRRepositoryPrefix}/notification-service-${Environment}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+  
+  AuthServiceRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: 
+        Fn::Sub: ${ECRRepositoryPrefix}/auth-service-${Environment}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+  
+  UserServiceRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: 
+        Fn::Sub: ${ECRRepositoryPrefix}/user-service-${Environment}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+  
+  # ECS Service Definitions
+  ApiGatewayTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: 
+        Fn::Sub: api-gateway-${Environment}
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: 
+        Ref: ECSTaskExecutionRole
+      TaskRoleArn: 
+        Ref: ECSTaskRole
+      ContainerDefinitions:
+        - Name: api-gateway
+          Image: 
+            Fn::Sub: ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepositoryPrefix}/api-gateway-${Environment}:${ImageTag}
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+          Environment:
+            - Name: ASPNETCORE_ENVIRONMENT
+              Value: 
+                Ref: Environment
+            - Name: JWT__Authority
+              Value: 
+                Fn::Sub: https://auth-api.${Environment}.paymentprocessor.com
+            - Name: JWT__Audience
+              Value: payment-processor-api
+            - Name: JWT__RequireHttpsMetadata
+              Value: 'true'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: 
+                Ref: ApiGatewayLogGroup
+              awslogs-region: 
+                Ref: AWS::Region
+              awslogs-stream-prefix: api-gateway
+  
+  ApiGatewayService:
+    Type: AWS::ECS::Service
+    DependsOn: ApiGatewayHTTPListener
+    Properties:
+      ServiceName: 
+        Fn::Sub: api-gateway-${Environment}
+      Cluster: 
+        Ref: ECSCluster
+      TaskDefinition: 
+        Ref: ApiGatewayTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Ref: PrivateSubnet1
+            - Ref: PrivateSubnet2
+          SecurityGroups:
+            - Ref: ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: api-gateway
+          ContainerPort: 80
+          TargetGroupArn: 
+            Ref: ApiGatewayTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      HealthCheckGracePeriodSeconds: 60
+  
+  # CloudWatch Logs
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Sub: /ecs/api-gateway-${Environment}
+      RetentionInDays: 30
+  
+  PaymentServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Sub: /ecs/payment-service-${Environment}
+      RetentionInDays: 30
+  
+  NotificationServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Sub: /ecs/notification-service-${Environment}
+      RetentionInDays: 30
+  
+  AuthServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Sub: /ecs/auth-service-${Environment}
+      RetentionInDays: 30
+  
+  UserServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Sub: /ecs/user-service-${Environment}
+      RetentionInDays: 30
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: 
+        Fn::Sub: HighCPU-${Environment}
+      AlarmDescription: 'Alarm if CPU utilization is too high'
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: 
+            Ref: ECSCluster
+      AlarmActions:
+        - Ref: AlertsTopic
+  
+  # SNS for Alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: 
+        Fn::Sub: payment-processor-alerts-${Environment}
+      DisplayName: Payment Processor Alerts
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: 
+      Fn::Sub: http://${ApiGatewayLoadBalancer.DNSName}
+  
+  RDSEndpoint:
+    Description: RDS endpoint
+    Value: 
+      Fn::GetAtt: RDSInstance.Endpoint.Address
+  
+  KafkaBootstrapServers:
+    Description: MSK bootstrap servers (broker string)
+    Value: 
+      Fn::GetAtt: MSKCluster.BootstrapBrokerString
+  
+  TransactionsTableName:
+    Description: DynamoDB Transactions table name
+    Value: 
+      Ref: TransactionsTable
+  
+  PaymentMethodsTableName:
+    Description: DynamoDB PaymentMethods table name
+    Value: 
+      Ref: PaymentMethodsTable
+  
+  NotificationQueueUrl:
+    Description: SQS Notification Queue URL
+    Value: 
+      Ref: PaymentNotificationQueue
+  
+  NotificationTopicArn:
+    Description: SNS Notification Topic ARN
+    Value: 
+      Ref: PaymentNotificationTopic
+  
+  ECSClusterName:
+    Description: ECS Cluster Name
+    Value: 
+      Ref: ECSCluster
+  
+  LoadBalancerDNS:
+    Description: Load Balancer DNS Name
+    Value: 
+      Fn::GetAtt: ApiGatewayLoadBalancer.DNSName

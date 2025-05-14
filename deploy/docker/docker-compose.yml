@@ -1,0 +1,185 @@
+version: '3.8'
+
+services:
+  # Database Services
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=YourStrong@Passw0rd
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    networks:
+      - payment-network
+
+  # Message Broker
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - payment-network
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - payment-network
+
+  # AWS LocalStack for AWS service emulation
+  localstack:
+    image: localstack/localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=dynamodb,s3,sqs,sns,ses
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+    volumes:
+      - localstack-data:/tmp/localstack
+    networks:
+      - payment-network
+
+  # LocalStack initialization
+  localstack-init:
+    build:
+      context: ./localstack-init
+      dockerfile: Dockerfile
+    depends_on:
+      - localstack
+    networks:
+      - payment-network
+
+  # Microservices
+  api-gateway:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/ApiGateway/Dockerfile
+    ports:
+      - "8000:80"
+      - "8001:443"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:80;https://+:443
+      - JWT__Authority=http://auth-api
+      - JWT__Audience=payment-processor-api
+      - JWT__RequireHttpsMetadata=false
+      - AllowedOrigins__0=http://localhost:3000
+    depends_on:
+      - payment-api
+      - notification-api
+      - auth-api
+      - user-api
+    networks:
+      - payment-network
+
+  auth-api:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Auth.API/Dockerfile
+    ports:
+      - "8010:80"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=AuthService;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True
+      - JWT__Secret=YourSecretKeyHereShouldBeLongEnoughForSecurity
+      - JWT__Issuer=http://auth-api
+      - JWT__Audience=payment-processor-api
+      - JWT__ExpiryInDays=7
+    depends_on:
+      - sqlserver
+    networks:
+      - payment-network
+
+  payment-api:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Payment.API/Dockerfile
+    ports:
+      - "8020:80"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=PaymentService;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True
+      - UseAWSDynamoDB=false
+      - AWS__Region=us-east-1
+      - AWS__ServiceURL=http://localstack:4566
+      - Stripe__SecretKey=sk_test_your_test_key
+      - Stripe__WebhookSecret=whsec_your_webhook_secret
+      - Kafka__BootstrapServers=kafka:29092
+      - Kafka__ClientId=payment-service
+      - Kafka__TopicPrefix=payment-service
+      - JWT__Authority=http://auth-api
+      - JWT__Audience=payment-processor-api
+      - JWT__RequireHttpsMetadata=false
+    depends_on:
+      - sqlserver
+      - kafka
+      - localstack
+      - localstack-init
+    networks:
+      - payment-network
+
+  notification-api:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Notification.API/Dockerfile
+    ports:
+      - "8030:80"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=NotificationService;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True
+      - AWS__Region=us-east-1
+      - AWS__ServiceURL=http://localstack:4566
+      - AWS__SES__SenderEmail=no-reply@paymentprocessor.com
+      - AWS__SNS__SenderId=PAYMENT
+      - Kafka__BootstrapServers=kafka:29092
+      - Kafka__GroupId=notification-service
+      - Kafka__TopicPrefix=payment-service
+      - JWT__Authority=http://auth-api
+      - JWT__Audience=notification-api
+      - JWT__RequireHttpsMetadata=false
+    depends_on:
+      - sqlserver
+      - kafka
+      - localstack
+      - localstack-init
+    networks:
+      - payment-network
+
+  user-api:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/User.API/Dockerfile
+    ports:
+      - "8040:80"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=UserService;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True
+      - JWT__Authority=http://auth-api
+      - JWT__Audience=user-api
+      - JWT__RequireHttpsMetadata=false
+    depends_on:
+      - sqlserver
+    networks:
+      - payment-network
+
+networks:
+  payment-network:
+    driver: bridge
+
+volumes:
+  sqlserver-data:
+  localstack-data:
